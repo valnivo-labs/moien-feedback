@@ -1,0 +1,25 @@
+name: Mistake in the course
+description: A wrong translation, spelling or grammar note
+title: "[content] "
+labels: [content]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Where is it?
+      description: The lesson, or the address of the page (for example /lesson/a1-01).
+      placeholder: /lesson/a1-01, the word "Moien"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What is wrong, and what should it say?
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source (optional)
+      description: An LOD entry or another reference, if you have one.
+      placeholder: https://lod.lu/...
