@@ -1,0 +1,222 @@
+# Builds, signs, attests and publishes the Android APK the website offers — in PUBLIC.
+#
+# This file lives in the private repository `valnivo-labs/moien` at
+# tools/public-builds/moien-feedback.yml, where tests/release.test.ts holds it to
+# Valnivo Labs' release rules (@valnivo_labs/release, src/lib/release.generated.ts),
+# and is COPIED to `valnivo-labs/moien-feedback` as .github/workflows/build.yml.
+# Edit it there only by copying from here. It is Valnivo's direct-APK design
+# (valnivo-labs/valnivo-android), adopted by Moien on 2026-09-29.
+#
+# WHY IT RUNS HERE
+#
+# The release is created with this job's own github.token, so GitHub shows
+# github-actions[bot] as its publisher, not a person's account; and the file is
+# built by this workflow, so `gh attestation verify moien.apk --repo
+# valnivo-labs/moien-feedback` proves which run produced it. Attestations on a
+# private repository need GitHub Enterprise Cloud; this repository is public.
+#
+# THE SOURCE STAYS PRIVATE
+#
+# It is checked out with a read-only deploy key on valnivo-labs/moien
+# (MOIEN_SOURCE_DEPLOY_KEY) — a key belonging to the repository, not to a person —
+# for the length of the job. Nothing uploads it: no upload-artifact step, and the
+# only files published are the APK and its checksum. The log is public, so Gradle
+# runs with --quiet.
+#
+# SIGNING
+#
+# The neutral certificate `CN=Moien, O=Valnivo Labs, L=Luxembourg, C=LU`, never
+# the Play upload key, whose certificate names a person. The release package
+# checks the exact subject and the pinned SHA-256 before anything is published.
+#
+# VERSION CODES
+#
+# 1000 + this repository's run number, named 2.1.<run>-direct. The Play builds
+# are 200 + the private repository's run number, far below. The download was
+# signed with the upload key until 2.0.63, so installing this over it needs an
+# uninstall first, once; the release notes say so.
+#
+# Runs only when somebody with write access presses Run workflow.
+#
+# Secrets, set in THIS repository: MOIEN_SOURCE_DEPLOY_KEY,
+# ANDROID_DIRECT_KEYSTORE_B64, ANDROID_DIRECT_KEYSTORE_PASSWORD,
+# FIREBASE_ANDROID_GOOGLE_SERVICES.
+name: Build, attest and publish the APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit, tag or branch of the app to build'
+        required: true
+        default: 'main'
+      dryRun:
+        description: 'Dry run: build unsigned, attest, publish nothing'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # the release
+      id-token: write # the identity the attestation is signed with
+      attestations: write
+    steps:
+      - name: Check out the app source (private, read-only)
+        uses: actions/checkout@v5
+        with:
+          repository: valnivo-labs/moien
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MOIEN_SOURCE_DEPLOY_KEY }}
+          path: source
+          persist-credentials: false
+
+      - name: Record which commit is being built
+        run: echo "SOURCE_SHA=$(git -C source rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
+          log-accepted-android-sdk-licenses: false
+
+      - name: Export the course from the web app's source
+        working-directory: source
+        run: |
+          npm ci --silent --no-audit --no-fund
+          node tools/export-android.mjs > /dev/null
+
+      - name: Restore the direct-download keystore and the Firebase config
+        run: |
+          if [ "$DRY" != "true" ]; then
+            if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+              echo "::error::Add the secrets ANDROID_DIRECT_KEYSTORE_B64 and ANDROID_DIRECT_KEYSTORE_PASSWORD to this repository." >&2
+              exit 1
+            fi
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/direct.keystore"
+          fi
+          if [ -n "$GOOGLE_SERVICES" ]; then
+            printf '%s' "$GOOGLE_SERVICES" > source/android/app/google-services.json
+          else
+            echo "::warning::FIREBASE_ANDROID_GOOGLE_SERVICES is not set: this build has no sign-in."
+          fi
+        env:
+          DRY: ${{ inputs.dryRun }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_DIRECT_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DIRECT_KEYSTORE_PASSWORD }}
+          GOOGLE_SERVICES: ${{ secrets.FIREBASE_ANDROID_GOOGLE_SERVICES }}
+
+      - name: Work out the version
+        run: |
+          echo "VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          if [ "$DRY" = "true" ]; then
+            echo "VERSION_NAME=2.1.$GITHUB_RUN_NUMBER-dryrun-direct" >> "$GITHUB_ENV"
+            echo "APK_IN=app-arm64-v8a-release-unsigned.apk" >> "$GITHUB_ENV"
+            echo "APK_OUT=moien-unsigned-dryrun.apk" >> "$GITHUB_ENV"
+          else
+            echo "VERSION_NAME=2.1.$GITHUB_RUN_NUMBER-direct" >> "$GITHUB_ENV"
+            echo "APK_IN=app-arm64-v8a-release.apk" >> "$GITHUB_ENV"
+            echo "APK_OUT=moien.apk" >> "$GITHUB_ENV"
+          fi
+        env:
+          DRY: ${{ inputs.dryRun }}
+
+      # No bundle: a .aab exists only to be uploaded to a store, and this key must
+      # never reach one. Play gets its builds from android.yml in the private repository.
+      - name: Test, build and sign
+        working-directory: source/android
+        run: |
+          KEYSTORE=""
+          [ "$DRY" = "true" ] || KEYSTORE="$RUNNER_TEMP/direct.keystore"
+          ./gradlew --no-daemon --quiet :app:testReleaseUnitTest :app:assembleRelease \
+            -Pmoien.versionCode="$VERSION_CODE" \
+            -Pmoien.versionName="$VERSION_NAME" \
+            -Pmoien.keystore="$KEYSTORE" \
+            -Pmoien.keystorePassword="$KEYSTORE_PASSWORD"
+        env:
+          DRY: ${{ inputs.dryRun }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DIRECT_KEYSTORE_PASSWORD }}
+
+      # The release rules, from valnivo-labs/foundation: the exact certificate and
+      # its pinned fingerprint. A mis-wired secret fails here rather than publishing
+      # a file whose certificate names a person.
+      - name: Check what signed it, and what it asks for
+        run: |
+          APK=source/android/app/build/outputs/apk/release/$APK_IN
+          [ -f "$APK" ] || { echo "::error::$APK was not produced" >&2; exit 1; }
+          TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ "$DRY" = "true" ]; then
+            echo "dry run: unsigned, so there is no certificate to check"
+          else
+            "$TOOLS/apksigner" verify --print-certs "$APK" > "$RUNNER_TEMP/certs.txt"
+            grep -E 'certificate DN|SHA-256 digest' "$RUNNER_TEMP/certs.txt"
+            node source/src/lib/release.generated.ts cert moien "$RUNNER_TEMP/certs.txt"
+          fi
+          "$TOOLS/aapt2" dump permissions "$APK" > "$RUNNER_TEMP/perms.txt"
+          node source/src/lib/release.generated.ts permissions moien "$RUNNER_TEMP/perms.txt"
+          cp "$APK" "$RUNNER_TEMP/$APK_OUT"
+          ( cd "$RUNNER_TEMP" && sha256sum "$APK_OUT" > "$APK_OUT.sha256" )
+          echo "SIZE_MB=$(awk "BEGIN { printf \"%.1f\", $(wc -c < "$RUNNER_TEMP/$APK_OUT") / 1048576 }")" >> "$GITHUB_ENV"
+          echo "SHA256=$(cut -d' ' -f1 "$RUNNER_TEMP/$APK_OUT.sha256")" >> "$GITHUB_ENV"
+        env:
+          DRY: ${{ inputs.dryRun }}
+
+      - name: Attest where the APK was built
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/${{ env.APK_OUT }}
+
+      - name: Publish the release
+        if: ${{ !inputs.dryRun }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          The Moien Android app, installable without Google Play.
+
+          **Version** $VERSION_NAME (version code $VERSION_CODE) · $SIZE_MB MB · Android 6.0 and later
+          **SHA-256** \`$SHA256\`
+          **Signed by** \`CN=Moien, O=Valnivo Labs, L=Luxembourg, C=LU\`
+          **Built by** this repository's workflow, run $GITHUB_RUN_NUMBER, from app commit \`$SOURCE_SHA\`
+
+          Check that this file was built here: \`gh attestation verify moien.apk --repo $GITHUB_REPOSITORY\`
+          The same checksum is published at <https://luxembourgish.app/moien.apk.sha256>.
+
+          Before you install:
+
+          - Android will ask permission to install from this source. That prompt is the operating system, not a fault.
+          - **If you installed Moien from this page before 2.1**, uninstall it first: earlier files were signed with a different key, and Android refuses to install over them. Sign in with Google before you do, and your progress comes back.
+          - It cannot be installed over the Google Play copy either, for the same reason; remove one before installing the other.
+          - It does not update itself. Come back here for a newer one.
+
+          The same course runs in any browser at <https://luxembourgish.app>, with nothing to install.
+          EOF
+          gh release create "v$VERSION_NAME" \
+            "$RUNNER_TEMP/moien.apk" "$RUNNER_TEMP/moien.apk.sha256" \
+            --repo "$GITHUB_REPOSITORY" --title "Moien $VERSION_NAME for Android" \
+            --notes-file "$RUNNER_TEMP/notes.md" --latest
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          node source/src/lib/release.generated.ts releases moien "$RUNNER_TEMP/releases.json"
+          echo "Published. The website shows it after its next deploy: run *Build and deploy* in valnivo-labs/moien." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Remove the keystore, the config and the source from the runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/direct.keystore" source
