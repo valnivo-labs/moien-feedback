@@ -217,6 +217,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # One release on the page at all times (owner, 2026-10-01): the one just
+      # published. Every older release goes, with its tag.
+      - name: Delete every older release
+        if: ${{ !inputs.dryRun }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[].tag_name' |
+            while read -r tag; do
+              [ "$tag" = "v$VERSION_NAME" ] && continue
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              echo "Deleted $tag"
+            done
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Remove the keystore, the config and the source from the runner
         if: always()
         run: rm -rf "$RUNNER_TEMP/direct.keystore" source
